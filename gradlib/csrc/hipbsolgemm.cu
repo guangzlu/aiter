@@ -10,6 +10,7 @@
 #include "hipbsolgemm.cuh"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <torch/library.h>
 
 // #include <rocblas/rocblas.h>
 
@@ -1032,7 +1033,7 @@ static ScalingType get_scaling_type(const torch::Tensor& scale_a,
 
 torch::Tensor hipb_mm(const torch::Tensor& mat1,
                       const torch::Tensor& mat2,
-                      const int solution_index,
+                      const int64_t solution_index,
                       std::optional<torch::Tensor> bias,
                       std::optional<c10::ScalarType> out_dtype,
                       std::optional<torch::Tensor> scaleA,
@@ -1046,6 +1047,8 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     hipblasLtGetVersion(hipblaslt_handle, &version);
     TORCH_CHECK(!bpreshuffle_flag || version >= 1500,
                 " to use bpreshuffle feature, hipblaslt version should be at least 1500.");
+
+    std::cout << "bpreshuffle_flag and version is " << bpreshuffle_flag << ", " << version << std::endl;
 
     auto mat1_strides{mat1.strides()};
     auto mat2_strides{mat2.strides()};
@@ -1062,6 +1065,14 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
 
     auto inDtype{mat1.options().dtype().toScalarType()};
     auto outDtype{out_dtype.has_value() ? out_dtype.value() : inDtype};
+    if (outDtype == c10::ScalarType::QUInt8) {
+    	std::cerr << "WARNING: outDtype is QUInt8 (value 13), overriding to BFloat16 (value 15). This is a temporary workaround." << std::endl;
+    	outDtype = c10::ScalarType::BFloat16;
+}
+
+    //std::cout << "0310 out_dtype.has_value() = " << out_dtype.has_value() << std::endl;
+    //std::cout << "0310 inDtype = " << c10::toString(inDtype) << std::endl;
+    //std::cout << "0310 outDtype = " << c10::toString(outDtype) << std::endl;
     auto options{at::TensorOptions().dtype(outDtype).device(at::kCUDA)};
     auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
 
@@ -1137,7 +1148,9 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
             // Rowwise scaling is only supported for FP8 input with BFloat16 output
             // For bpreshuffle (swizzled layout), proper alignment is required
             // Note: m can be any value >= 1, but n should be >= 16 and aligned
-            TORCH_CHECK(outDtype == at::kBFloat16,
+            
+	    
+	    TORCH_CHECK(outDtype == at::kBFloat16,
                         "hipblaslt rowwise scaled_mm only supports BFloat16 output but got ",
                         outDtype);
             TORCH_CHECK(inDtype == at::kFloat8_e4m3fn || inDtype == at::kFloat8_e4m3fnuz,
@@ -1177,6 +1190,8 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     auto hipblasInType  = dtype_map.at(inDtype);
     auto hipblasOutType = dtype_map.at(outDtype);
 
+    std::cout << "hipblasOutType (as int) = " << static_cast<int>(hipblasOutType) << std::endl;
+
     void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
     void* ptrB{static_cast<void*>((transpose_result ? mat1 : mat2).data_ptr())};
     void* ptrC{static_cast<void*>(result.data_ptr())};
@@ -1185,6 +1200,8 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(mat1));
     const hipStream_t current_stream = at::hip::getCurrentHIPStream();
     void* bias_ptr = bias.has_value() ? static_cast<void*>(bias.value().data_ptr()) : nullptr;
+
+    int idx = static_cast<int>(solution_index);
 
     CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(hipblaslt_handle,
                                                     transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
@@ -1207,11 +1224,27 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
                                                     hipblasInType,
                                                     hipblasOutType,
                                                     current_stream,
-                                                    solution_index,
+                                                    idx,
                                                     bpreshuffle_flag,
                                                     use_rowwise));
 
     return result;
+}
+
+torch::Tensor hipb_mm_meta(
+    const torch::Tensor& mat1,
+    const torch::Tensor& mat2,
+    int64_t solution_index,
+    std::optional<torch::Tensor> bias,
+    std::optional<c10::ScalarType> out_dtype,
+    std::optional<torch::Tensor> scaleA,
+    std::optional<torch::Tensor> scaleB,
+    std::optional<torch::Tensor> scaleOut,
+    std::optional<bool> bpreshuffle) {
+  auto out_shape = {mat1.size(0), mat2.size(1)};
+  auto out_dtype_val = out_dtype.value_or(mat1.scalar_type());
+  std::cout << "[meta kernel] out_dtype_val = " << toString(out_dtype_val) << std::endl;
+  return torch::empty(out_shape, mat1.options().dtype(out_dtype_val));
 }
 
 // find all hipblas solutions and return them to python land
@@ -1393,18 +1426,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("hipb_create_extension", &hipb_create_extension, "create_extension");
     m.def("hipb_destroy_extension", &hipb_destroy_extension, "destroy_extension");
-    m.def("hipb_mm",
-          &hipb_mm,
-          "hipb_mm",
-          py::arg("mat1"),
-          py::arg("mat2"),
-          py::arg("solution_index"),
-          py::arg("bias")        = std::nullopt,
-          py::arg("out_dtype")   = std::nullopt,
-          py::arg("scaleA")      = std::nullopt,
-          py::arg("scaleB")      = std::nullopt,
-          py::arg("scaleOut")    = std::nullopt,
-          py::arg("bpreshuffle") = std::nullopt);
     m.def("hipb_findallsols",
           &hipb_findallsols,
           "hipb_findallsols",
@@ -1417,6 +1438,37 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scaleC")      = std::nullopt,
           py::arg("bpreshuffle") = false);
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
+}
+
+TORCH_LIBRARY(gradlib, m) {
+    std::cout << "Registering aiter::hipb_mm ..." << std::endl;
+    m.def(
+        "hipb_mm(Tensor mat1, Tensor mat2, int solution_index, "
+        "Tensor? bias=None, ScalarType? out_dtype=None, "
+        "Tensor? scaleA=None, Tensor? scaleB=None, Tensor? scaleOut=None, "
+        "bool? bpreshuffle=None) -> Tensor"
+    );
+}
+
+
+TORCH_LIBRARY_IMPL(gradlib, CUDA, m) {
+    using HipbMMFunc = torch::Tensor (*)(
+        const torch::Tensor&,
+        const torch::Tensor&,
+        int64_t,
+        std::optional<torch::Tensor>,
+        std::optional<c10::ScalarType>,
+        std::optional<torch::Tensor>,
+        std::optional<torch::Tensor>,
+        std::optional<torch::Tensor>,
+        std::optional<bool>
+    );
+    m.impl("hipb_mm", static_cast<HipbMMFunc>(&hipb_mm));
+    //m.impl("hipb_mm", hipb_mm);
+}
+
+TORCH_LIBRARY_IMPL(gradlib, Meta, m) {
+    m.impl("hipb_mm", hipb_mm_meta);
 }
 
 
