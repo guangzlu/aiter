@@ -8,6 +8,8 @@
 // __HIP_NO_HALF_CONVERSIONS__ #endif
 
 #include "hipbsolgemm.cuh"
+#include <c10/core/SymInt.h>
+
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/library.h>
@@ -1041,19 +1043,22 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
                       std::optional<torch::Tensor> scaleOut,
                       std::optional<bool> bpreshuffle)
 {
+    // std::cout << "hipb_mm entered" << std::endl;
     bool bpreshuffle_flag = bpreshuffle.value_or(false);
 
     int version;
     hipblasLtGetVersion(hipblaslt_handle, &version);
+    //std::cout << "bpreshuffle_flag and version is " << bpreshuffle_flag << ", " << version << std::endl;
     TORCH_CHECK(!bpreshuffle_flag || version >= 1500,
                 " to use bpreshuffle feature, hipblaslt version should be at least 1500.");
-
-    std::cout << "bpreshuffle_flag and version is " << bpreshuffle_flag << ", " << version << std::endl;
 
     auto mat1_strides{mat1.strides()};
     auto mat2_strides{mat2.strides()};
     auto mat1_sizes{mat1.sizes()};
     auto mat2_sizes{mat2.sizes()};
+
+    //std::cout << "  mat1 sizes: " << mat1.sizes() << std::endl;
+    //std::cout << "  mat2 sizes: " << mat2.sizes() << std::endl;
 
     TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
     TORCH_CHECK(mat1.dtype() == mat2.dtype(),
@@ -1062,17 +1067,23 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
                 " != ",
                 mat2.dtype());
     TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
-
+    // std::cout << "  out_dtype: " << c10::toString(out_dtype.value_or(mat1.scalar_type())) << std::endl;
     auto inDtype{mat1.options().dtype().toScalarType()};
     auto outDtype{out_dtype.has_value() ? out_dtype.value() : inDtype};
-    if (outDtype == c10::ScalarType::QUInt8) {
-    	std::cerr << "WARNING: outDtype is QUInt8 (value 13), overriding to BFloat16 (value 15). This is a temporary workaround." << std::endl;
-    	outDtype = c10::ScalarType::BFloat16;
-}
 
-    //std::cout << "0310 out_dtype.has_value() = " << out_dtype.has_value() << std::endl;
-    //std::cout << "0310 inDtype = " << c10::toString(inDtype) << std::endl;
-    //std::cout << "0310 outDtype = " << c10::toString(outDtype) << std::endl;
+    if (outDtype == c10::ScalarType::QUInt8) {
+    	//std::cerr << "WARNING: outDtype is QUInt8, overriding to BFloat16. This is a temporary workaround." << std::endl;
+    	outDtype = c10::ScalarType::BFloat16;
+    }
+    if (outDtype == c10::ScalarType::Float) {
+        //std::cerr << "WARNING: outDtype is Float, overriding to Half. This is a temporary workaround." << std::endl;
+        outDtype = c10::ScalarType::Half;
+    }
+
+
+    //std::cout << "[impl kernel]0310 out_dtype.has_value() = " << out_dtype.has_value() << std::endl;
+    //std::cout << "[impl kernel]0310 inDtype = " << c10::toString(inDtype) << std::endl;
+    //std::cout << "[impl kernel]0310 outDtype = " << c10::toString(outDtype) << std::endl;
     auto options{at::TensorOptions().dtype(outDtype).device(at::kCUDA)};
     auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
 
@@ -1190,8 +1201,12 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     auto hipblasInType  = dtype_map.at(inDtype);
     auto hipblasOutType = dtype_map.at(outDtype);
 
-    std::cout << "hipblasOutType (as int) = " << static_cast<int>(hipblasOutType) << std::endl;
-
+    //std::cout << "HIP_R_16F = " << HIP_R_16F << std::endl;
+    //std::cout << "HIP_R_32F = " << HIP_R_32F << std::endl;
+    //std::cout << "hipblasOutType (as int) = " << static_cast<int>(hipblasOutType) << std::endl;
+    //std::cout << "==>>> 0319 ==> outDtype = " << c10::toString(outDtype) << std::endl;
+    //c10::ScalarType dtype = bias->scalar_type();
+    //std::cout << "[impl kernel] bias dtype: " << c10::toString(dtype) << std::endl;
     void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
     void* ptrB{static_cast<void*>((transpose_result ? mat1 : mat2).data_ptr())};
     void* ptrC{static_cast<void*>(result.data_ptr())};
@@ -1202,6 +1217,8 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     void* bias_ptr = bias.has_value() ? static_cast<void*>(bias.value().data_ptr()) : nullptr;
 
     int idx = static_cast<int>(solution_index);
+
+    // std::cout << "go into hipblasLtMatmul_sol_wrapper " << std::endl;
 
     CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(hipblaslt_handle,
                                                     transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
@@ -1241,11 +1258,29 @@ torch::Tensor hipb_mm_meta(
     std::optional<torch::Tensor> scaleB,
     std::optional<torch::Tensor> scaleOut,
     std::optional<bool> bpreshuffle) {
-  auto out_shape = {mat1.size(0), mat2.size(1)};
+
+  c10::SymInt sym_m = mat1.sym_size(0);
+  c10::SymInt sym_n = mat2.sym_size(1);
+  std::cout << "sym_m = " << sym_m << std::endl;
+  std::cout << "sym_n = " << sym_n << std::endl;
+
+  c10::SymIntArrayRef out_shape({sym_m, sym_n});
   auto out_dtype_val = out_dtype.value_or(mat1.scalar_type());
   std::cout << "[meta kernel] out_dtype_val = " << toString(out_dtype_val) << std::endl;
+
+  return at::empty_symint(out_shape, mat1.options().dtype(out_dtype_val));  
+  /*
+  if (bias.has_value()) {
+    const torch::Tensor& bias_tensor = bias.value();
+    c10::ScalarType dtype = bias_tensor.scalar_type();
+    std::cout << "[meta kernel] bias dtype: " << c10::toString(dtype) << " (enum value: " << static_cast<int>(dtype) << ")" << std::endl;
+  } else {
+    std::cout << "[meta kernel] bias is nullopt (no tensor provided)" << std::endl;
+  }
+  
   return torch::empty(out_shape, mat1.options().dtype(out_dtype_val));
-}
+*/
+  }
 
 // find all hipblas solutions and return them to python land
 std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
@@ -1467,9 +1502,9 @@ TORCH_LIBRARY_IMPL(gradlib, CUDA, m) {
     //m.impl("hipb_mm", hipb_mm);
 }
 
-TORCH_LIBRARY_IMPL(gradlib, Meta, m) {
-    m.impl("hipb_mm", hipb_mm_meta);
-}
+//TORCH_LIBRARY_IMPL(gradlib, Meta, m) {
+//    m.impl("hipb_mm", hipb_mm_meta);
+//}
 
 
 
